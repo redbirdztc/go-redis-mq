@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"git.geebento.com/go/redisstream"
+	"github.com/redbirdztc/go-redis-mq"
 )
 
 // 以下示例展示三种典型用法。所有 stub 实现都是空壳，仅为了让示例代码可以编译。
