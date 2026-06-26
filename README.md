@@ -149,7 +149,36 @@ type OutboxStore interface {
 
 `MaxDeliver` 次仍失败的消息搬到 `<stream>:dead`，附带 `orig_id` / `orig_stream` / `group` / `consumer` / `retry_count` / `dead_at_ms` / `payload` 等元信息，并触发一次告警。
 
-> 注意：本库目前只**写**死信流，不提供死信的消费 / 重放 API——需要的话由接入方自行消费 `<stream>:dead`。
+#### 死信处理回调 `DeadLetterHandler`（可选）
+
+如果不想自己再起一个消费 `<stream>:dead` 的服务，可在 `ConsumerSpec` 上挂一个**消费端死信回调**，在消息死亡时就地接管（落库 / 路由 / 自定义告警）：
+
+```go
+_ = m.Register(redisstream.ConsumerSpec{
+    Stream:   "order_pay_success",
+    Group:    "order-workers",
+    Consumer: "worker-0",
+    Handler:  bizHandler,
+    DeadLetterHandler: func(ctx context.Context, msg redisstream.Message, info redisstream.DeadLetterInfo) error {
+        // 例如落到 order_dead 表，或转投另一个补偿队列
+        return saveDeadLetter(ctx, msg, info)
+    },
+})
+```
+
+语义（**与死信流并存，回调 best-effort**）：
+
+- 消息死亡时，库**先**把它 `XAdd` 到 `<stream>:dead`（持久兜底、死信的真相之源，MAXLEN 自动裁剪），**再**调用回调。
+- **无论回调成功还是失败，库都会 `XAck` 原消息并发死信告警**——消息已持久落在死信流里，不会丢。回调返回 `error` / panic 只额外记错误日志 + 发一条"回调失败"告警，**不阻塞 XAck、不触发库级重试**（避免毒消息每轮重写死信流、冲刷 `<stream>:dead` 的 MAXLEN 把别的死信挤掉）。
+- 因此回调是**尽力而为的即时反应钩子**；要保证死信被可靠处理，请消费 `<stream>:dead`。
+- 回调**必须幂等且并发安全**：XAck 失败会重试、且多实例下多个 reaper 会对同一 `OrigID` 并发调用——按 `info.OrigID` 去重。
+- payload 已被 MAXLEN 裁剪掉的死信**不会**触发回调（无消息体可交付），库照常 XAck + 告警。
+- 回调在 `HandlerTimeout` 子 ctx 内执行并带 panic 兜底，挂死 / panic 的回调不会冻结 reaper；回调应尊重 ctx。
+- `DeadLetterHandler` 为 `nil` 时行为不变（仅写死信流 + 告警）。
+
+`DeadLetterInfo` 携带 `Stream` / `Group` / `Consumer` / `OrigID`（原消息 ID，去重键）/ `RetryCount` / `Idle` / `DeadID`（写入死信流后分配的 ID）。
+
+> 仍未内建的是死信流的**消费 / 重放服务**——`DeadLetterHandler` 是"死亡时就地反应"，若需要可靠/事后批量处理 `<stream>:dead`，仍由接入方消费该死信流。
 
 ---
 

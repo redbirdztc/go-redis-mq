@@ -21,6 +21,45 @@ import (
 // 失败消息首次重试延迟约为 ClaimMinIdle（默认 60s），而非热重试；可按业务调小
 type Handler func(ctx context.Context, msg Message) error
 
+// DeadLetterInfo 一条死信消息的元信息，随 DeadLetterHandler 传给接入方
+type DeadLetterInfo struct {
+	// Stream 业务流名（不含 Manager.keyPrefix 前缀）
+	Stream string
+	// Group 消费者组名
+	Group string
+	// Consumer 死亡时该消息归属的 consumer 名
+	Consumer string
+	// OrigID 原 stream 上的消息 ID（= msg.ID），死信去重的幂等键
+	OrigID string
+	// RetryCount 死亡时的累计投递次数（deliver count）
+	RetryCount int64
+	// Idle 死亡时距上次 delivery 的时间
+	Idle time.Duration
+	// DeadID 消息写入 <stream>:dead 死信流后分配的 ID，便于审计与关联
+	DeadID string
+}
+
+// DeadLetterHandler 死信处理回调（可选，挂在 ConsumerSpec.DeadLetterHandler）
+//
+// 当一条消息累计投递达到 MaxDeliver 仍失败、被判定死亡时，库会：
+//  1. 先把它 XAdd 到 <stream>:dead 死信流（持久兜底，是死信的"真相之源"）；
+//  2. 再调用本回调（best-effort 即时反应钩子），把原消息 msg 与 DeadLetterInfo
+//     交给接入方就地处理（落库 / 路由 / 自定义告警等）；
+//  3. 无论回调成功还是失败，库都会 XAck 原消息并发死信告警——因为消息已持久落在
+//     死信流里，不会丢。回调返回 error / panic 只记错误日志 + 一条回调失败告警，
+//     **不会**阻塞 XAck、也**不会**触发库级重试（避免毒消息无限重写死信流、
+//     反复冲刷 <stream>:dead 的 MAXLEN 把别的死信挤掉）。
+//
+// 因此：
+//   - 回调是"尽力而为"的即时处理；要保证死信被可靠处理，请消费 <stream>:dead。
+//   - 回调可能因 XAck 失败重试、且多实例下多个 reaper 会对同一 orig_id 并发调用，
+//     故回调必须幂等且并发安全，按 DeadLetterInfo.OrigID 去重。
+//   - payload 已被 MAXLEN 裁剪掉的死信不会触发回调（无消息体可交付）。
+//
+// 回调在 HandlerTimeout 子 ctx 内执行并带 panic 兜底，挂死（尊重 ctx）或 panic 的
+// 回调不会冻结 reaper 扫描循环；回调应尊重 ctx 才能被超时打断。
+type DeadLetterHandler func(ctx context.Context, msg Message, info DeadLetterInfo) error
+
 // ConsumerSpec 一个 stream 的消费规格，调用方注册到 Manager
 type ConsumerSpec struct {
 	// Stream 业务流名（不含 Manager.keyPrefix 前缀）
@@ -39,6 +78,11 @@ type ConsumerSpec struct {
 
 	// Handler 业务处理函数（必填）
 	Handler Handler
+
+	// DeadLetterHandler 死信处理回调（可选）
+	// 消息累计投递达 MaxDeliver 死亡时，先写 <stream>:dead 再调用本回调。
+	// 为 nil 时仅写死信流 + 告警（向后兼容）。详见 DeadLetterHandler 类型说明
+	DeadLetterHandler DeadLetterHandler
 
 	// 以下为可选项，零值时套用默认值（见 defaults.go）
 

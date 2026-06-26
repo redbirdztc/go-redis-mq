@@ -40,6 +40,9 @@
 //     （worker 与 reaper 两个 goroutine 都会调用 handler）
 //   - 死信：MaxDeliver 次仍处理失败的消息搬到 <stream>:dead 流并告警
 //     （失败消息由 reaper 经 XClaim 重投，首次重试延迟约 ClaimMinIdle）
+//     可选挂 ConsumerSpec.DeadLetterHandler：写死信流后调用的 best-effort 钩子，
+//     让消费端就地接管死信（落库 / 路由）；回调成败都会 XAck（消息已落死信流不丢），
+//     失败仅告警不重试。要可靠处理死信请消费 <stream>:dead
 //   - 每次 handler 在 HandlerTimeout（默认 30s，强制 < ClaimMinIdle）子 ctx 内执行，
 //     给单次执行设上界，避免挂死 handler 冻结 reaper、架空死信升级；
 //     handler 必须尊重 ctx 才能被超时打断。BatchSize=1 时它还能避免同一消息被
