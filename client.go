@@ -38,24 +38,15 @@ type Client interface {
 	// maxLenApprox = 0 表示不裁剪；> 0 时用 MAXLEN ~ 近似裁剪
 	XAdd(ctx context.Context, stream string, maxLenApprox int64, values map[string]interface{}) (id string, err error)
 
-	// XReadGroupBlock 阻塞式读取消息，最长等待 block 时长
-	// fromID = ">" 读新消息（未分配给任何 consumer 的）
-	// fromID = "0" 读自己 PEL 里未 ack 的旧消息（一般用 XReadGroupNoBlock 即可）
-	// block <= 0 是非法值，请用 XReadGroupNoBlock；实现可视为等价于 XReadGroupNoBlock
+	// XReadGroupBlock 阻塞式读取新消息，最长等待 block 时长
+	// worker 主循环只用 fromID = ">"（读未分配给任何 consumer 的新消息）
+	// 失败 / 卡住消息的重投走 reaper 的 XClaim 路径，不在此读取 PEL
 	// 空结果应返回 nil 错误 + 空切片
 	//
 	// 实现警告：go-redis v8 的 XReadGroupArgs.Block = 0 是 Redis BLOCK 0 无限阻塞，
-	// 不是非阻塞，新手实现时容易踩坑。请确保 block <= 0 走 XReadGroupNoBlock 分支
+	// 不是非阻塞。block <= 0 时实现应改用非阻塞读取（go-redis v8.3.3 用
+	// XReadGroupArgs.Block = -1，让 go-redis 不追加 BLOCK 子句），不要用 0
 	XReadGroupBlock(ctx context.Context, group, consumer, stream, fromID string, count int64, block time.Duration) ([]Message, error)
-
-	// XReadGroupNoBlock 非阻塞读取消息（Redis 端 XREADGROUP 不带 BLOCK 子句）
-	// 队列空时立即返回 nil 错误 + 空切片
-	// 主要用于 worker "先读 PEL 里的重投消息" 路径
-	//
-	// 实现要点（go-redis v8.3.3）：
-	//   args := &redis.XReadGroupArgs{Block: -1, ...}  // -1 让 go-redis 不追加 BLOCK
-	// 不要用 0，0 是无限阻塞
-	XReadGroupNoBlock(ctx context.Context, group, consumer, stream, fromID string, count int64) ([]Message, error)
 
 	// XAck 确认消息处理完成
 	XAck(ctx context.Context, stream, group, id string) error

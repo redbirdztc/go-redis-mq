@@ -25,9 +25,6 @@ func (stubClient) XAdd(context.Context, string, int64, map[string]interface{}) (
 func (stubClient) XReadGroupBlock(context.Context, string, string, string, string, int64, time.Duration) ([]redisstream.Message, error) {
 	return nil, nil
 }
-func (stubClient) XReadGroupNoBlock(context.Context, string, string, string, string, int64) ([]redisstream.Message, error) {
-	return nil, nil
-}
 func (stubClient) XAck(context.Context, string, string, string) error { return nil }
 func (stubClient) XClaim(context.Context, string, string, string, time.Duration, []string) ([]redisstream.Message, error) {
 	return nil, nil

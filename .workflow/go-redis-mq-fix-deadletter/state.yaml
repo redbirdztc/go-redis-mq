@@ -1,0 +1,23 @@
+workflow_id: go-redis-mq-fix-deadletter
+skill: small-requirement-delivery
+invocation_mode: explicit
+goal: 修复 go-redis-mq 死信不可达缺陷——worker 不再自旋读 PEL，重投职责收归 reaper
+size_decision:
+  result: small
+repo: /home/jett/project/cookhere-project/Codes/go-redis-mq
+trunk: main
+worktree: /home/jett/project/cookhere-project/Codes/.worktrees/go-redis-mq-fix-deadletter
+branch: fix/deadletter-unreachable
+openspec_change: fix-deadletter-unreachable
+phase: archive_done
+next_step: commit + push + cleanup
+review:
+  rounds: 3
+  critical: 0
+  major: 0
+  minor: 0
+  result: PASS
+lint_result: pass(gofmt 干净 + golangci-lint 0 issues；manager.go/outbox.go 预存 gofmt nit 超范围未动)
+archive_result: 2026-06-26-fix-deadletter-unreachable
+push_result: null
+cleanup_result: null

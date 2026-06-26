@@ -10,10 +10,15 @@ import (
 //
 // 返回 nil → Manager 自动 XAck 该消息
 // 返回 error → 不 ack，留在 PEL，等 reaper 周期巡检
-// reaper 视 idle 超时为"卡住"，会 XClaim 重置（deliver count +1）
-// 累计 deliver count 超过 ConsumerSpec.MaxDeliver 自动转死信流
+// reaper 视 idle 超时为"卡住"，会 XClaim 抢回（deliver count +1）并直接重投
+// 累计 deliver count 达到 ConsumerSpec.MaxDeliver 自动转死信流
 //
-// handler 必须幂等：消息可能因 reaper 重试 / 进程崩溃 / XAck 失败被重复投递
+// handler 必须幂等且并发安全：
+//   - 幂等：消息可能因 reaper 重投 / 进程崩溃 / XAck 失败被重复投递
+//   - 并发安全：同进程内 worker（处理新消息）与 reaper（重投卡住消息）两个
+//     goroutine 可能并发调用 handler
+//
+// 失败消息首次重试延迟约为 ClaimMinIdle（默认 60s），而非热重试；可按业务调小
 type Handler func(ctx context.Context, msg Message) error
 
 // ConsumerSpec 一个 stream 的消费规格，调用方注册到 Manager
@@ -52,6 +57,23 @@ type ConsumerSpec struct {
 	// BlockTimeout XREADGROUP 阻塞超时
 	// 进程关停时 worker 最多等 BlockTimeout 才能退出，因此不要设太长
 	BlockTimeout time.Duration
+
+	// HandlerTimeout 单条消息 handler 的执行超时（基于 ctx）
+	//
+	// 会被 applyConsumerDefaults 夹到严格小于 ClaimMinIdle。
+	//
+	// 首要目的：给单次 handler 执行设上界。handler 由 worker 与 reaper 两个 goroutine
+	// 调用；一个挂死的 handler 若在 reaper 中无限阻塞，会冻结 reaper 扫描循环，使整个
+	// stream 再也无法升级到死信。限制在 HandlerTimeout 内可避免这一点。
+	//
+	// 次要作用：当 BatchSize=1 时，它也保证 worker 处理完该消息后它才可能变得可被
+	// reaper claim，避免同一消息被并发重投。BatchSize>1 时不提供该保证（一批消息同时
+	// 投递、串行处理，靠后的消息可能在被处理前就 idle 超时被 reaper 重投）——这属于
+	// at-least-once 内的重复投递，由 handler 幂等且并发安全兜底。
+	//
+	// 注意：超时通过 ctx 取消传递，handler 必须尊重 ctx 才能真正被打断；
+	// 完全忽略 ctx 的阻塞调用无法被强制中止。
+	HandlerTimeout time.Duration
 }
 
 // applyConsumerDefaults 把 ConsumerSpec 的零值字段填上默认值
@@ -71,13 +93,36 @@ func applyConsumerDefaults(spec *ConsumerSpec) {
 	if spec.BlockTimeout <= 0 {
 		spec.BlockTimeout = DefaultBlockTimeout
 	}
+	if spec.HandlerTimeout <= 0 {
+		spec.HandlerTimeout = DefaultHandlerTimeout
+	}
+	// HandlerTimeout 夹到严格小于 ClaimMinIdle。
+	//
+	// 首要目的是给单次 handler 执行设上界：挂死（但尊重 ctx）的 handler 会在
+	// HandlerTimeout 后被打断，不会永久冻结 reaper 扫描循环或无限拖延死信升级。
+	//
+	// 次要作用：当 BatchSize=1 时，它也保证 worker 处理完一条消息后该消息才可能
+	// 变得可被 reaper claim，从而不会被并发重投。注意当 BatchSize>1 时不提供这一
+	// 保证——一批消息在同一时刻被投递（idle 同时归零）却串行处理，靠后的消息可能
+	// 在 worker 尚未处理到它时 idle 就超过 ClaimMinIdle 而被 reaper 重投。这属于
+	// at-least-once 语义内的重复投递，由"handler 幂等且并发安全"的约束兜底，并非错误。
+	if spec.HandlerTimeout >= spec.ClaimMinIdle {
+		margin := spec.ClaimMinIdle / 10
+		if margin <= 0 {
+			margin = 1
+		}
+		spec.HandlerTimeout = spec.ClaimMinIdle - margin
+	}
 }
 
 // runConsumer 一个 stream 的 worker 主循环
 //
-// 每轮先非阻塞读 PEL 里的旧消息（reaper 重置过 idle 的）
-// 再阻塞读新消息
-// 处理失败不 ack，留给 reaper 处理
+// 只阻塞读新消息（fromID=">"）。处理失败不 ack，留在 PEL。
+// 失败 / 卡住消息的重投统一由 reaper 通过 XClaim 驱动——只有 XClaim 会让
+// deliver count 增长，这样 MaxDeliver → 死信 的升级链路才能真正生效。
+//
+// worker 刻意不再 XReadGroup id="0" 自行重读 PEL：那条路径会重置 idle 但不增加
+// deliver count，会把 reaper 的 idle 超时判断和死信升级一起架空（毒消息永世热重试）。
 func (m *Manager) runConsumer(ctx context.Context, spec ConsumerSpec) {
 	streamKey := m.keyPrefix + spec.Stream
 
@@ -89,20 +134,9 @@ func (m *Manager) runConsumer(ctx context.Context, spec ConsumerSpec) {
 		default:
 		}
 
-		// 1. 先读 PEL：fromID="0" 非阻塞读自己 PEL 里被 reaper 重置过的旧消息
-		m.readPEL(ctx, spec, streamKey)
-
-		// 2. 再读新消息：fromID=">" 阻塞等待 BlockTimeout
+		// 阻塞读新消息：fromID=">" 阻塞等待 BlockTimeout
 		m.readNew(ctx, spec, streamKey)
 	}
-}
-
-// readPEL 非阻塞读取自己 PEL 里的旧消息（reaper 重置 idle 后回流到当前 consumer）
-func (m *Manager) readPEL(ctx context.Context, spec ConsumerSpec, streamKey string) {
-	defer m.recoverReadLoop(ctx, spec)
-
-	msgs, err := m.client.XReadGroupNoBlock(ctx, spec.Group, spec.Consumer, streamKey, "0", spec.BatchSize)
-	m.afterRead(ctx, spec, streamKey, msgs, err, "0")
 }
 
 // readNew 阻塞读取新消息
@@ -148,7 +182,18 @@ func (m *Manager) afterRead(ctx context.Context, spec ConsumerSpec, streamKey st
 }
 
 // handleOne 调用 Handler 处理单条消息，根据返回值决定是否 XACK
+//
+// handler 在 HandlerTimeout 限定的子 ctx 内执行：超时即 ctx 取消，handler 应据此
+// 返回（视为失败、不 ack、留 PEL 等下一轮）。这保证 worker 在消息变得可被 reaper
+// claim 之前一定收手，并防止挂死的 handler 冻结 reaper 扫描循环。
 func (m *Manager) handleOne(ctx context.Context, spec ConsumerSpec, streamKey string, msg Message) {
+	hctx := ctx
+	if spec.HandlerTimeout > 0 {
+		var cancel context.CancelFunc
+		hctx, cancel = context.WithTimeout(ctx, spec.HandlerTimeout)
+		defer cancel()
+	}
+
 	// 单条消息的 panic 不能扩散到 worker 循环
 	var handlerErr error
 	func() {
@@ -161,7 +206,7 @@ func (m *Manager) handleOne(ctx context.Context, spec ConsumerSpec, streamKey st
 				handlerErr = &handlerPanicError{value: r}
 			}
 		}()
-		handlerErr = spec.Handler(ctx, msg)
+		handlerErr = spec.Handler(hctx, msg)
 	}()
 
 	if handlerErr != nil {

@@ -16,8 +16,9 @@
 //
 //  2. 消费（Manager.Register + Manager.Run）
 //     注册 ConsumerSpec，库为每个 stream 启动 worker + reaper 协程。
-//     worker 主循环先非阻塞读 PEL（重投），再阻塞读新消息；
-//     reaper 周期扫超时 pending，根据 deliver count 决定 XClaim 重试或转死信。
+//     worker 主循环只阻塞读新消息；失败 / 卡住消息留在 PEL，统一由 reaper 重投。
+//     reaper 周期扫超时 pending，XClaim 抢回（deliver count +1）并直接重投，
+//     deliver count 达 MaxDeliver 转死信。重投只走 XClaim 一条路，死信升级才可达。
 //
 //  3. 本地消息表（Dispatcher + OutboxStore）
 //     适合需要"业务写库 + 投递消息"原子性的场景，例如下单后发奖、订单回调外部系统。
@@ -35,8 +36,14 @@
 //
 // # 语义保证
 //
-//   - Stream 内消息：至少一次投递（at-least-once），handler 必须幂等
+//   - Stream 内消息：至少一次投递（at-least-once），handler 必须幂等且并发安全
+//     （worker 与 reaper 两个 goroutine 都会调用 handler）
 //   - 死信：MaxDeliver 次仍处理失败的消息搬到 <stream>:dead 流并告警
+//     （失败消息由 reaper 经 XClaim 重投，首次重试延迟约 ClaimMinIdle）
+//   - 每次 handler 在 HandlerTimeout（默认 30s，强制 < ClaimMinIdle）子 ctx 内执行，
+//     给单次执行设上界，避免挂死 handler 冻结 reaper、架空死信升级；
+//     handler 必须尊重 ctx 才能被超时打断。BatchSize=1 时它还能避免同一消息被
+//     worker 与 reaper 并发重投，BatchSize>1 不保证（详见 ConsumerSpec.HandlerTimeout）
 //   - Outbox：业务 + outbox 一旦 commit，dispatcher 持续重试 XAdd 直到成功；
 //     调用方决定何时放弃（在 FetchPending 的 SQL 里过滤掉超限的行即可）
 //     消费方按 OutboxRecord.LocalID 做幂等

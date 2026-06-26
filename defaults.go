@@ -20,6 +20,11 @@ const (
 	// 也是 worker 在 ctx 取消后退出的最大延迟，不要设太长
 	DefaultBlockTimeout time.Duration = 5 * time.Second
 
+	// DefaultHandlerTimeout 默认单条消息 handler 执行超时
+	// 刻意小于 DefaultClaimMinIdle(60s)：给单次 handler 执行设上界，避免挂死
+	// （但尊重 ctx）的 handler 冻结 reaper 扫描循环、架空死信升级
+	DefaultHandlerTimeout time.Duration = 30 * time.Second
+
 	// DefaultMaxLen 默认 Stream 近似裁剪上限
 	// 业务可按 "峰值 QPS × 最坏滞后秒数 × 2~3" 估算后用 PublishWithMaxLen 覆盖
 	DefaultMaxLen int64 = 100000
