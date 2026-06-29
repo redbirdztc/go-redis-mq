@@ -73,6 +73,13 @@ func ExampleManager_Run() {
 			fmt.Printf("handle id=%s\n", msg.ID)
 			return nil
 		},
+		// 可选：死信处理回调。消息重试 MaxDeliver 次仍失败时，库先把它写入
+		// <stream>:dead 兜底，再调用本回调让消费端就地接管（落库 / 路由）。
+		// 回调必须幂等且并发安全，按 info.OrigID 去重；不设则仅写死信流 + 告警。
+		DeadLetterHandler: func(ctx context.Context, msg redisstream.Message, info redisstream.DeadLetterInfo) error {
+			fmt.Printf("dead id=%s retry=%d\n", info.OrigID, info.RetryCount)
+			return nil // 例如落到 order_dead 表
+		},
 		// 其它字段留空走默认值
 	})
 
