@@ -86,6 +86,16 @@ d, _ := redisstream.NewDispatcher(redisstream.DispatcherConfig{
 go d.Run(ctx) // FetchPending → XAdd → MarkPublished
 ```
 
+> ⚠️ **启动顺序（outbox + 消费同一批 stream 时必看）**：`Dispatcher.Run` 一启动就立刻发一轮，
+> 而消费组按 `"$"` 创建（只收建组后的新消息）。若 dispatcher 在消费组创建【之前】就把积压 XADD 进流，
+> 这些消息会被 `"$"` 跳过、永不投递且不重试（静默丢失）。因此**务必先建组再启动 dispatcher**：
+> ```go
+> if err := m.EnsureGroups(ctx); err != nil { /* fail-closed：放弃启动 dispatcher */ return }
+> go d.Run(ctx)   // 此时所有组已存在，积压 XADD 在建组之后 → 不丢
+> go m.Run(ctx)   // Run 内部会再 ensure 一次（BUSYGROUP 幂等）
+> ```
+> `EnsureGroups` 保留 `"$"` 语义：后续真正新加入的消费组不会重放整条流的历史。
+
 ---
 
 ## 你需要实现的接口

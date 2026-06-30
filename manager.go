@@ -195,11 +195,42 @@ func (m *Manager) runInternal(ctx context.Context) error {
 	return nil
 }
 
+// EnsureGroups 预先创建所有已注册 spec 的 consumer group（幂等，BUSYGROUP 视为已存在）
+//
+// 用途：消除「Dispatcher 启动即发一轮」与「按 "$" 建组只收建组后消息」之间的启动竞态。
+// 调用方应在【启动 Dispatcher 之前】先调用本方法，保证 group 先于任何 XADD 存在；
+// 如此 "$" 既能消费随后被 Dispatcher 泵入的 outbox 积压（XADD 发生在建组之后），
+// 又不会像 startID="0" 那样让后续新加入的 group 重放整条流的历史。
+//
+// 单进程内顺序调用即可保证有序；多实例下各 pod 都先 Ensure 再发，首个 pod 建组、其余 BUSYGROUP。
+// 返回首个非 BUSYGROUP 的硬错误（如 Redis 不支持 Stream）；ctx 取消按关停处理返回 ctx.Err()。
+// 失败时调用方应放弃启动 Dispatcher（fail-closed），避免消息 XADD 出去却无组消费而丢失。
+func (m *Manager) EnsureGroups(ctx context.Context) error {
+	m.mu.Lock()
+	specs := make([]ConsumerSpec, len(m.specs))
+	copy(specs, m.specs)
+	m.mu.Unlock()
+
+	for i := range specs {
+		if err := m.ensureGroup(ctx, specs[i]); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("redisstream: ensure group %s/%s: %w", specs[i].Stream, specs[i].Group, err)
+		}
+	}
+	return nil
+}
+
 // ensureGroup 保证 stream + group 存在
 //
 // 用 XGroupCreateMkStream（stream 不存在自动创建）
 // 已存在的 group 通过 Client.IsBusyGroup 识别后忽略
-// startID = "$" → 只消费创建后的新消息，避免重放历史
+//
+// startID = "$" → 只消费建组后的新消息，新加入的 group 不重放历史。
+// ⚠️ 启动竞态：Dispatcher 启动即发一轮，若它在本组创建【之前】就把 outbox 积压 XADD 进流，
+// 按 "$" 建组会跳过这些先到消息 → 永不投递且不重试（静默丢消息）。
+// 故调用方须在启动 Dispatcher 前先调用 EnsureGroups，保证组先于任何 XADD 存在。
 func (m *Manager) ensureGroup(ctx context.Context, spec ConsumerSpec) error {
 	streamKey := m.keyPrefix + spec.Stream
 	err := m.client.XGroupCreateMkStream(ctx, streamKey, spec.Group, "$")
